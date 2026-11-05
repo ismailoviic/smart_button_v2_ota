@@ -28,7 +28,7 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.1"
+#define FW_VERSION          "2.0.2"
 #define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
@@ -46,8 +46,8 @@
 #define PIN_BAT_ADC      1    // Voltage divider 10k + 10k
 #define PIN_PLUG         0    // Digital: HIGH means plugged, if verified
 #define PIN_BUTTON       2    // Active HIGH, external 10k pull-down
-#define PIN_LED_R       21
-#define PIN_LED_G       20
+#define PIN_LED_R       20
+#define PIN_LED_G       21
 #define PIN_LED_B        3
 #define PIN_SPI_SCK      4
 #define PIN_SPI_MISO     5
