@@ -28,7 +28,7 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.8"
+#define FW_VERSION          "2.0.9"
 #define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
@@ -420,7 +420,8 @@ int versionCompare(String remote) {
   return 0;
 }
 bool downloadAndInstallFirmware() {
-  String url=githubBase()+"build/esp32.esp32.esp32c3/firmware.bin";
+String url = githubBase() +
+  "Smart_Button_V2/build/esp32.esp32.esp32c3/Smart_Button_V2.ino.bin";
   WiFiClientSecure tls; tls.setCACert(SB2_TLS_ROOTS);
   HTTPClient http;
   if(!http.begin(tls,url)) return false;
