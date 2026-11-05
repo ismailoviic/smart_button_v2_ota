@@ -1,1 +1,0 @@
-# Compiled application binary goes here after Sketch > Export Compiled Binary.
