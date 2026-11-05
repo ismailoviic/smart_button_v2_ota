@@ -28,7 +28,7 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.2"
+#define FW_VERSION          "2.0.3"
 #define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
@@ -46,9 +46,8 @@
 #define PIN_BAT_ADC      1    // Voltage divider 10k + 10k
 #define PIN_PLUG         0    // Digital: HIGH means plugged, if verified
 #define PIN_BUTTON       2    // Active HIGH, external 10k pull-down
-#define PIN_LED_R       20
-#define PIN_LED_G       21
-#define PIN_LED_B        3
+#define PIN_LED_R       21   // Verified RED output; green channel disconnected/unused
+#define PIN_LED_B        3   // Verified BLUE output
 #define PIN_SPI_SCK      4
 #define PIN_SPI_MISO     5
 #define PIN_SPI_MOSI     6
@@ -199,7 +198,7 @@ volatile bool portalMode = false, wantPortal = false, wantOTA = false;
 bool buttonLastRaw = false, buttonStable = false, longHold = false;
 uint32_t buttonEdgeMs = 0, buttonDownMs = 0, bootMs = 0;
 uint32_t ledUntilMs = 0, lastTelemetry = 0, lastWifiAttempt = 0, lastOtaCheck = 0, nextPost = 0;
-uint8_t ledEffect = 0; // 1 green RFID, 2 red double blink, 3 cyan setup, 4 red error
+uint8_t ledEffect = 0; // 1 blue RFID, 2 red double blink button, 3 blue setup, 4 red error
 uint32_t bootId = 0;
 bool wasOnline = false, clockStarted = false, checkedOTAOnConnect = false;
 
@@ -224,30 +223,34 @@ String escapeHtml(String value) {
   value.replace(">","&gt;"); value.replace("\"","&quot;");
   value.replace("'","&#39;"); return value;
 }
-void rgb(bool r,bool g,bool b) {
-  digitalWrite(PIN_LED_R,r?HIGH:LOW);
-  digitalWrite(PIN_LED_G,g?HIGH:LOW);
-  digitalWrite(PIN_LED_B,b?HIGH:LOW);
+// Green LED channel is intentionally unused due to reported hardware failure.
+void rgb(bool red, bool blue) {
+  digitalWrite(PIN_LED_R,red?HIGH:LOW);
+  digitalWrite(PIN_LED_B,blue?HIGH:LOW);
 }
 void ledFlash(uint8_t effect, uint32_t ms) {
   ledEffect=effect; ledUntilMs=millis()+ms;
 }
 void updateLED() {
   uint32_t now=millis();
-  if (now-bootMs<900) { // Power-on LED check: R, G, B
+  if (now-bootMs<600) { // Power-on LED check: RED then BLUE only
     uint32_t step=(now-bootMs)/300;
-    rgb(step==0,step==1,step==2); return;
+    rgb(step==0,step==1); return;
   }
   if (ledEffect && (int32_t)(ledUntilMs-now)>0) {
-    if (ledEffect==1) rgb(false,true,false);
-    else if (ledEffect==2) { uint32_t elapsed=600-(ledUntilMs-now); rgb((elapsed%300)<140,false,false); }
-    else if (ledEffect==3) rgb(false,true,true);
-    else rgb(true,false,false);
+    if (ledEffect==1) rgb(false,true); // RFID: blue
+    else if (ledEffect==2) { // Button: two short red flashes
+      uint32_t remaining=ledUntilMs-now;
+      uint32_t elapsed=600-remaining;
+      rgb((elapsed%300)<140,false);
+    }
+    else if (ledEffect==3) rgb(false,true); // Setup portal: blue
+    else rgb(true,false); // Error: red
     return;
   }
   ledEffect=0;
   bool offline=WiFi.status()!=WL_CONNECTED;
-  rgb(offline && (now%3000)<120,false,false);
+  rgb(offline && (now%3000)<120,false);
 }
 uint16_t readBatteryMv() {
   uint32_t sum=0;
@@ -352,6 +355,7 @@ String eventJson() {
   else json+="\"p_badge_uid\":null,";
   json+="\"p_metadata\":{";
   json+="\"firmware\":\""+String(FW_VERSION)+"\",";
+  json+="\"firmware_version\":\""+String(FW_VERSION)+"\",";
   json+="\"boot_id\":"+String(e.boot_id)+",";
   json+="\"sequence\":"+String(e.sequence)+",";
   json+="\"uptime_s\":"+String(e.uptime_s)+",";
@@ -656,8 +660,8 @@ void setup() {
   Serial.begin(115200);
   delay(900); // USB CDC enumeration only
   Serial.printf("\n=== SMART BUTTON V2 %s / ESP32-C3 ===\n",FW_VERSION);
-  pinMode(PIN_LED_R,OUTPUT); pinMode(PIN_LED_G,OUTPUT); pinMode(PIN_LED_B,OUTPUT);
-  rgb(false,false,false);
+  pinMode(PIN_LED_R,OUTPUT); pinMode(PIN_LED_B,OUTPUT);
+  rgb(false,false);
   pinMode(PIN_BUTTON,INPUT); pinMode(PIN_PLUG,INPUT); pinMode(PIN_BAT_ADC,INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_BAT_ADC,ADC_11db);
