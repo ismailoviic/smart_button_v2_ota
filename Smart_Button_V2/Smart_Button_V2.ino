@@ -34,8 +34,8 @@
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
 #define SUPABASE_URL        "https://bvddjxonnunymwhuzitt.supabase.co"  // No trailing /
 #define SUPABASE_KEY        "sb_publishable_aN5yqTjexArUtTB5evTQsA_vV38-Aa-"
-#define SUPABASE_DEVICE_TOKEN "\x0b3c5728a7bb48061988453b6410491ca7ba9198e4401146a3011d330ddb3b49"
-#define GITHUB_USERNAME     "YOUR_GITHUB_USERNAME"
+#define SUPABASE_DEVICE_TOKEN "6d8ad66e1d4248198f4f66ca4b7e0cecca5b9f9393894acda7388f17449d2883"
+#define GITHUB_USERNAME     "ismailoviic"
 #define GITHUB_REPO         "smart_button_v2_ota"
 #define GITHUB_BRANCH       "main"
 #define SETUP_AP_PASSWORD   "changeMeV2-2026" // Prototype only; change before deployment
