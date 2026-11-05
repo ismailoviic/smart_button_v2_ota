@@ -28,7 +28,7 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.7"
+#define FW_VERSION          "2.0.8"
 #define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
