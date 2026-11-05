@@ -28,7 +28,7 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.0"
+#define FW_VERSION          "2.0.1"
 #define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
@@ -38,7 +38,7 @@
 #define GITHUB_USERNAME     "ismailoviic"
 #define GITHUB_REPO         "smart_button_v2_ota"
 #define GITHUB_BRANCH       "main"
-#define SETUP_AP_PASSWORD   "changeMeV2-2026" // Prototype only; change before deployment
+#define SETUP_AP_PASSWORD   "12345678" // Prototype only; change before deployment
 #define TEST_MODE_DEFAULT   true
 // ====================================================
 

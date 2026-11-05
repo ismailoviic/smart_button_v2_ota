@@ -3,7 +3,7 @@
   "builtInLibrariesFolders": "/Users/ismailessabbagh/Library/Arduino15/libraries",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
-  "fqbn": "esp32:esp32:esp32c3:UploadSpeed=921600,CDCOnBoot=default,CPUFreq=160,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default",
+  "fqbn": "esp32:esp32:esp32c3:UploadSpeed=921600,CDCOnBoot=cdc,CPUFreq=160,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default",
   "hardwareFolders": "/Users/ismailessabbagh/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12,/Users/ismailessabbagh/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12",
   "otherLibrariesFolders": "/Users/ismailessabbagh/Documents/Arduino/libraries",
   "sketchLocation": "/Users/ismailessabbagh/Documents/1- Projects/1- ESS Technologies/2 - ESS Tech Clients/1- Yassine Gaga - Smart Button/Phase 2 - Smart Button V2/smart_button_v2_ota/Smart_Button_V2"
