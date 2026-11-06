@@ -1,11 +1,13 @@
 /*
   SMART BUTTON V2 — ESP32-C3 Super Mini
-  Direct Supabase HTTPS events + GitHub version.txt / firmware.bin OTA.
-  Arduino IDE only: Sketch > Export Compiled Binary; copy application .bin to GitHub.
+  Posts its events straight to the OMS Textile ERP on the local network (plain
+  HTTP, no hub, no cloud) + GitHub version.txt / firmware.bin OTA.
+  Arduino IDE: Sketch > Export Compiled Binary; copy the application .bin to the repo.
   Target board: ESP32C3 Dev Module; USB CDC On Boot: Enabled;
-  Partition scheme: 4 MB / dual OTA app slots (e.g. Minimal SPIFFS).
-  Prototype: edit the placeholder constants below, or configure via setup AP.
-  Do not publish Wi-Fi passwords or device tokens in a public GitHub repository.
+  Partition scheme: 4 MB / dual OTA app slots (Default 4MB with spiffs).
+  Wi-Fi, device code and ERP address are set on the setup page (hold the
+  button 3 s, join "SmartButtonV2-Setup", open http://192.168.4.1).
+  The ERP address to type there is printed by oms-textile-backend/scripts/button-address.ps1.
 */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,6 +20,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <esp_system.h>
+#include <esp_mac.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -28,19 +31,17 @@
 #endif
 
 // ==================== EDIT THESE ====================
-#define FW_VERSION          "2.0.13"
-#define DEVICE_CODE         "BTN-V2-001"       // Must match sb2_devices in Supabase
+#define FW_VERSION          "2.1.0"
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
-#define SUPABASE_URL        "https://bvddjxonnunymwhuzitt.supabase.co"  // No trailing /
-#define SUPABASE_KEY        "sb_publishable_aN5yqTjexArUtTB5evTQsA_vV38-Aa-"
-#define SUPABASE_DEVICE_TOKEN "6d8ad66e1d4248198f4f66ca4b7e0cecca5b9f9393894acda7388f17449d2883"
 #define GITHUB_USERNAME     "ismailoviic"
 #define GITHUB_REPO         "smart_button_v2_ota"
 #define GITHUB_BRANCH       "main"
 #define SETUP_AP_PASSWORD   "12345678" // Prototype only; change before deployment
-#define TEST_MODE_DEFAULT   true
 // ====================================================
+
+// ERP endpoint, appended to the address set on the setup page (http://IP:PORT).
+static const char INGEST_PATH[] = "/api/v1/iot/ingest";
 
 // Pins confirmed by the WORKING hardware-test sketch.
 #define PIN_BAT_ADC      1    // Voltage divider 10k + 10k
@@ -58,14 +59,15 @@
 
 static const uint32_t WIFI_RETRY_MS = 20000UL;
 static const uint32_t POST_RETRY_MS = 7000UL;
+static const uint32_t HEARTBEAT_MS = 30000UL;   // the ERP shows a button offline after 60 s
 static const uint32_t OTA_CHECK_MS = 3600000UL; // boot and every hour
 static const uint32_t BUTTON_HOLD_MS = 3000UL;
 static const uint32_t BUTTON_DEBOUNCE_MS = 45UL;
 static const size_t QUEUE_LIMIT = 24;
-static const uint32_t QUEUE_MAGIC = 0x53423234UL;
+static const uint32_t QUEUE_MAGIC = 0x42544E32UL; // "BTN2": queues of older firmware are dropped
 
-// Public TLS certificate roots (not credentials), supporting common Supabase/GitHub chains.
-// Public CA root certificates (not secrets). Regenerate if server trust changes.
+// Public CA root certificates (not secrets), used only for the GitHub OTA download.
+// Regenerate if GitHub's certificate chain changes.
 
 static const char SB2_TLS_ROOTS[] = R"SB2_CA(
 -----BEGIN CERTIFICATE-----
@@ -167,17 +169,13 @@ p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
 -----END CERTIFICATE-----
 )SB2_CA";
 
-
 struct ButtonEvent {
-  char uuid[37];
+  char uuid[37];   // event_id: kept across resends so the ERP takes it once
   char uid[24];
-  uint32_t boot_id;
   uint32_t sequence;
   uint32_t uptime_s;
   uint16_t battery_mv;
-  uint8_t plugged;
-  uint8_t kind;    // 0=DEVICE_ON, 1=BUTTON_CLICK, 2=RFID_SCAN
-  uint8_t is_test;
+  uint8_t kind;    // 0=DEVICE_ON, 1=PIECE_DONE, 2=BADGE_SCAN
 };
 struct QueueStore {
   uint32_t magic;
@@ -191,15 +189,14 @@ SemaphoreHandle_t queueLock = nullptr;
 WebServer web(80);
 DNSServer dns;
 MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
-String cfgDevice = DEVICE_CODE, cfgSsid = WIFI_SSID, cfgPass = WIFI_PASSWORD;
-String cfgUrl = SUPABASE_URL, cfgKey = SUPABASE_KEY, cfgToken = SUPABASE_DEVICE_TOKEN;
-bool testMode = TEST_MODE_DEFAULT;
+String macText, defaultDevice;
+String cfgDevice, cfgSsid = WIFI_SSID, cfgPass = WIFI_PASSWORD, cfgServer;
 volatile bool portalMode = false, wantPortal = false, wantOTA = false;
 bool buttonLastRaw = false, buttonStable = false, longHold = false;
 uint32_t buttonEdgeMs = 0, buttonDownMs = 0, bootMs = 0;
 uint32_t ledUntilMs = 0, lastTelemetry = 0, lastWifiAttempt = 0, lastOtaCheck = 0, nextPost = 0;
+uint32_t lastHeartbeat = 0;
 uint8_t ledEffect = 0; // 1 blue RFID, 2 red double blink button, 3 blue setup, 4 red error
-uint32_t bootId = 0;
 bool wasOnline = false, clockStarted = false, checkedOTAOnConnect = false;
 
 // All custom event types are used only within function bodies to prevent
@@ -271,23 +268,42 @@ void makeUUID(char out[37]) {
     "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
     b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
 }
+// Factory MAC, readable before Wi-Fi starts. Also gives the default device code.
+void readIdentity() {
+  uint8_t m[6]={0};
+  esp_read_mac(m,ESP_MAC_WIFI_STA);
+  char buf[18];
+  snprintf(buf,sizeof(buf),"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
+  macText=buf;
+  snprintf(buf,sizeof(buf),"BTN-%02X%02X%02X",m[3],m[4],m[5]);
+  defaultDevice=buf;
+}
+// "http://192.168.1.2:8000/", or the full ingest URL pasted by mistake -> "http://192.168.1.2:8000".
+String normalizeServer(String url) {
+  url.trim();
+  while(url.endsWith("/")) url.remove(url.length()-1);
+  if(url.endsWith(INGEST_PATH)) url.remove(url.length()-strlen(INGEST_PATH));
+  while(url.endsWith("/")) url.remove(url.length()-1);
+  return url;
+}
+bool serverSet() { return cfgServer.startsWith("http://"); }
 void loadConfig() {
   Preferences p;
-  if(p.begin("sb2cfg",true)) {
-    cfgDevice=p.getString("device",DEVICE_CODE);
+  if(p.begin("sb2cfg",false)) {
+    cfgDevice=p.getString("device",defaultDevice);
     cfgSsid=p.getString("ssid",WIFI_SSID);
     cfgPass=p.getString("pass",WIFI_PASSWORD);
-    cfgUrl=p.getString("url",SUPABASE_URL);
-    cfgKey=p.getString("pub",SUPABASE_KEY);
-    cfgToken=p.getString("token",SUPABASE_DEVICE_TOKEN);
-    testMode=p.getBool("test",TEST_MODE_DEFAULT);
+    cfgServer=p.getString("server","");
+    // Settings of the former cloud (Supabase) firmware: no longer used, the token is a secret.
+    for(const char *old : {"url","pub","token","test"}) if(p.isKey(old)) p.remove(old);
     p.end();
   }
-  cfgUrl.trim();
-  while(cfgUrl.endsWith("/")) cfgUrl.remove(cfgUrl.length()-1);
-  Serial.printf("[CFG] Device=%s SSID=%s test=%d tokenPresent=%d\n",
-                cfgDevice.c_str(),cfgSsid.c_str(),testMode,cfgToken.length()>=32);
-  Serial.println("[CFG] Saved setup-portal settings override source-code placeholders.");
+  cfgDevice.trim();
+  if(cfgDevice.isEmpty()) cfgDevice=defaultDevice;
+  cfgServer=normalizeServer(cfgServer);
+  Serial.printf("[CFG] Device=%s MAC=%s SSID=%s ERP=%s\n",
+                cfgDevice.c_str(),macText.c_str(),cfgSsid.c_str(),
+                serverSet()?cfgServer.c_str():"(not set)");
 }
 void loadQueue() {
   queueStore.magic=QUEUE_MAGIC;
@@ -324,78 +340,74 @@ void enqueueEvent(uint8_t kind,const String &uid="") {
   ButtonEvent e={};
   makeUUID(e.uuid);
   uid.substring(0,sizeof(e.uid)-1).toCharArray(e.uid,sizeof(e.uid));
-  e.kind=kind; e.is_test=testMode;
-  e.boot_id=bootId; e.uptime_s=millis()/1000;
-  e.battery_mv=readBatteryMv(); e.plugged=isPlugged();
+  e.kind=kind;
+  e.uptime_s=millis()/1000;
+  e.battery_mv=readBatteryMv();
   e.sequence=++queueStore.sequence;
   queueStore.entries[queueStore.count++]=e;
   if(!persistQueue()) {
     --queueStore.count; --queueStore.sequence;
     Serial.println("[QUEUE] Flash save failed"); ledFlash(4,1200);
-  } else Serial.printf("[EVENT] Queued type=%u test=%d seq=%lu pending=%u\n",
-                       kind,e.is_test,(unsigned long)e.sequence,queueStore.count);
+  } else Serial.printf("[EVENT] Queued type=%u seq=%lu pending=%u\n",
+                       kind,(unsigned long)e.sequence,queueStore.count);
   xSemaphoreGive(queueLock);
 }
-String eventName(uint8_t kind,bool test) {
-  const char *namesTest[]={"TEST_DEVICE_ON","TEST_BUTTON_CLICK","TEST_RFID_SCAN"};
-  const char *namesLive[]={"DEVICE_ON","BUTTON_CLICK","RFID_SCAN"};
-  if(kind>2) return "INVALID";
-  return test ? namesTest[kind] : namesLive[kind];
+const char *eventName(uint8_t kind) {
+  static const char *names[]={"DEVICE_ON","PIECE_DONE","BADGE_SCAN"};
+  return kind<=2 ? names[kind] : "INVALID";
 }
-String eventJson() {
-  // Called by the network worker with queueLock held. Do not expose token in logs.
-  if(queueStore.count==0) return "";
-  const ButtonEvent &e=queueStore.entries[0];
+// Body of POST /api/v1/iot/ingest (IotIngestPayload on the ERP side).
+// eventId/badge empty = JSON null; a heartbeat carries neither.
+String ingestJson(const char *type,const char *eventId,const char *badge,
+                  uint16_t mv,uint32_t uptime) {
   String json="{";
-  json+="\"p_device_code\":\""+escapeJson(cfgDevice)+"\",";
-  json+="\"p_device_token\":\""+escapeJson(cfgToken)+"\",";
-  json+="\"p_event_type\":\""+eventName(e.kind,e.is_test)+"\",";
-  json+="\"p_event_uuid\":\""+String(e.uuid)+"\",";
-  if(e.uid[0]) json+="\"p_badge_uid\":\""+String(e.uid)+"\",";
-  else json+="\"p_badge_uid\":null,";
-  json+="\"p_metadata\":{";
-  json+="\"firmware\":\""+String(FW_VERSION)+"\",";
-  json+="\"firmware_version\":\""+String(FW_VERSION)+"\",";
-  json+="\"boot_id\":"+String(e.boot_id)+",";
-  json+="\"sequence\":"+String(e.sequence)+",";
-  json+="\"uptime_s\":"+String(e.uptime_s)+",";
-  json+="\"battery_mv\":"+String(e.battery_mv)+",";
-  json+="\"battery_pct_approx\":"+String(batteryPercent(e.battery_mv))+",";
-  json+="\"plugged\":"+String(e.plugged ? "true" : "false")+",";
-  json+="\"wifi_rssi_dbm\":"+String(WiFi.RSSI());
-  json+="}}";
+  json+="\"device_id\":\""+escapeJson(cfgDevice)+"\",";
+  json+="\"mac\":\""+macText+"\",";
+  json+="\"firmware_version\":\"" FW_VERSION "\",";
+  json+="\"event_type\":\""+String(type)+"\",";
+  json+="\"event_id\":"+(eventId[0] ? String("\"")+eventId+"\"" : String("null"))+",";
+  json+="\"badge_uid\":"+(badge[0] ? String("\"")+escapeJson(badge)+"\"" : String("null"))+",";
+  json+="\"battery_mv\":"+String(mv)+",";
+  json+="\"battery_pct\":"+String(batteryPercent(mv))+",";
+  json+="\"uptime_seconds\":"+String(uptime)+",";
+  json+="\"rssi\":"+String(WiFi.RSSI());
+  json+="}";
   return json;
 }
-bool clockValid() { return time(nullptr)>1700000000; }
+// HTTP status, or a negative HTTPClient error when the ERP was not reached.
+int postToErp(const String &body) {
+  WiFiClient net; HTTPClient http;
+  if(!http.begin(net,cfgServer+INGEST_PATH)) return -1;
+  http.setConnectTimeout(5000); http.setTimeout(8000);
+  http.addHeader("Content-Type","application/json");
+  int status=http.POST(body);
+  String answer=status>0 ? http.getString() : http.errorToString(status);
+  http.end();
+  if(answer.length()>160) answer=answer.substring(0,160);
+  Serial.printf("[ERP] HTTP=%d %s\n",status,answer.c_str());
+  return status;
+}
+// Sends the oldest queued event. False = keep it and retry later.
 bool sendFirstEvent() {
-  if(!clockValid() || WiFi.status()!=WL_CONNECTED) return false;
-  String body, uid;
+  String body, id;
   if(xSemaphoreTake(queueLock,pdMS_TO_TICKS(500))!=pdTRUE) return false;
   if(!queueStore.count) { xSemaphoreGive(queueLock); return true; }
-  body=eventJson(); uid=queueStore.entries[0].uuid;
-  String name=eventName(queueStore.entries[0].kind,queueStore.entries[0].is_test);
+  const ButtonEvent &e=queueStore.entries[0];
+  body=ingestJson(eventName(e.kind),e.uuid,e.uid,e.battery_mv,e.uptime_s);
+  id=e.uuid;
+  Serial.printf("[ERP] Sending %s seq=%lu\n",eventName(e.kind),(unsigned long)e.sequence);
   xSemaphoreGive(queueLock);
 
-  WiFiClientSecure tls; tls.setCACert(SB2_TLS_ROOTS);
-  HTTPClient http;
-  String endpoint=cfgUrl+"/rest/v1/rpc/sb2_ingest_event";
-  if(!http.begin(tls,endpoint)) { Serial.println("[API] begin failed"); return false; }
-  http.setConnectTimeout(7000); http.setTimeout(12000);
-  http.addHeader("Content-Type","application/json");
-  http.addHeader("apikey",cfgKey);
-  int status=http.POST(body);
-  String answer=http.getString();
-  http.end();
-  // PostgreSQL RPC returns {"ok":true,...}. Require both HTTP 2xx and ok=true.
-  String normalized=answer;
-  normalized.replace(" ",""); normalized.replace("\n",""); normalized.replace("\r","");
-  bool accepted=(status>=200 && status<300 && normalized.indexOf("\"ok\":true")>=0);
-  if(answer.length()>180) answer=answer.substring(0,180);
-  Serial.printf("[API] %s HTTP=%d accepted=%d response=%s\n",name.c_str(),status,accepted,answer.c_str());
-  if(!accepted) return false;
+  int status=postToErp(body);
+  bool taken=status>=200 && status<300;
+  // Any other 4xx is a refusal that a resend will not change (bad payload,
+  // wrong address): drop it, or it would block every event behind it.
+  bool refused=status>=400 && status<500 && status!=408 && status!=429;
+  if(!taken && !refused) return false;
+  if(refused) { Serial.println("[ERP] Event refused and dropped"); ledFlash(4,1200); }
   if(xSemaphoreTake(queueLock,pdMS_TO_TICKS(1000))==pdTRUE) {
-    if(queueStore.count && uid==queueStore.entries[0].uuid) {
-      // Drop event only after confirmed server acceptance; UUID handles retries.
+    if(queueStore.count && id==queueStore.entries[0].uuid) {
+      // Drop event only once the ERP answered; the event_id makes a replay harmless.
       memmove(queueStore.entries,queueStore.entries+1,
               (queueStore.count-1)*sizeof(ButtonEvent));
       queueStore.count--;
@@ -405,7 +417,13 @@ bool sendFirstEvent() {
   }
   return true;
 }
+// Keeps the button shown online in the ERP; not queued, a missed one is not resent.
+void sendHeartbeat() {
+  uint16_t mv=readBatteryMv();
+  postToErp(ingestJson("HEARTBEAT","","",mv,millis()/1000));
+}
 
+bool clockValid() { return time(nullptr)>1700000000; }
 String githubBase() {
   return String("https://raw.githubusercontent.com/")+GITHUB_USERNAME+"/"+
          GITHUB_REPO+"/"+GITHUB_BRANCH+"/";
@@ -525,20 +543,21 @@ void portalHome() {
   input,select{background:#0c1424;color:white;border:1px solid #53657e}
   button{background:#49dcb1;border:0;font-weight:bold;color:#15251f}
   label{display:block;margin-top:8px}small{color:#bac5d3}</style></head><body><main><h2>Smart Button V2 Setup</h2>
-  <p>Use a 2.4 GHz network. Credentials are stored on the ESP32-C3.</p><form action="/save" method="post">
-  <label>Device code</label><input name="device" value=")HTML";
+  <p><small>MAC )HTML";
+  html+=macText;
+  html+=" &middot; firmware " FW_VERSION;
+  html+=R"HTML(</small></p><p>Use a 2.4 GHz network, the same one as the ERP server.</p><form action="/save" method="post">
+  <label>Device code (its name in the ERP)</label><input name="device" maxlength="50" value=")HTML";
   html+=escapeHtml(cfgDevice);
   html+=R"HTML(" required><label>Detected Wi-Fi networks</label><select id="networks"><option>Scanning...</option></select>
   <label>SSID (editable)</label><input id="ssid" name="ssid" required value=")HTML";
   html+=escapeHtml(cfgSsid);
   html+=R"HTML("><label>Wi-Fi Password (blank keeps saved)</label><input name="password" type="password">
-  <label>Supabase project URL</label><input name="url" required value=")HTML";
-  html+=escapeHtml(cfgUrl);
-  html+=R"HTML("><label>Supabase publishable key (blank keeps saved)</label><input name="key" type="password">
-  <label>Device token (blank keeps saved)</label><input name="token" type="password">
-  <label><input style="display:inline;width:auto" type="checkbox" name="test" )HTML";
-  if(testMode) html+="checked ";
-  html+=R"HTML(> Test mode</label><button type="submit">Save & Restart</button></form>
+  <label>ERP address</label><input name="server" required placeholder="http://192.168.1.2:8000" value=")HTML";
+  html+=escapeHtml(cfgServer);
+  html+=R"HTML(">
+  <small>Printed by scripts/button-address.ps1 on the ERP server.</small>
+  <button type="submit">Save &amp; Restart</button></form>
   <script>async function scan(){const s=document.getElementById('networks');try{
   await fetch('/scan',{method:'POST'});for(let i=0;i<22;i++){
   await new Promise(r=>setTimeout(r,600));const d=await(await fetch('/results')).json();
@@ -547,16 +566,19 @@ void portalHome() {
   s.onchange=()=>{if(s.value)document.getElementById('ssid').value=s.value};return;}}
   s.replaceChildren(new Option('Scan timed out — enter SSID manually',''));
   }catch(e){s.replaceChildren(new Option('Enter SSID manually',''))}}scan();</script>
-  <small>If changing the device code, update the Supabase registration token accordingly.</small>
   </main></body></html>)HTML";
   web.send(200,"text/html",html);
 }
 void savePortal() {
-  String device=web.arg("device"), ssid=web.arg("ssid"), url=web.arg("url");
-  String key=web.arg("key"), token=web.arg("token"), pass=web.arg("password");
-  device.trim(); ssid.trim(); url.trim();
-  if(ssid.isEmpty() || device.isEmpty() || !url.startsWith("https://")) {
-    web.send(400,"text/plain","Invalid device/SSID/URL"); return;
+  String device=web.arg("device"), ssid=web.arg("ssid"), pass=web.arg("password");
+  String server=normalizeServer(web.arg("server"));
+  device.trim(); ssid.trim();
+  if(ssid.isEmpty() || device.isEmpty() || device.length()>50) {
+    web.send(400,"text/plain","Invalid device code or SSID"); return;
+  }
+  // The ERP is on the local network: plain http://IP:PORT only.
+  if(!server.startsWith("http://") || server.length()<=7) {
+    web.send(400,"text/plain","ERP address must look like http://192.168.1.2:8000"); return;
   }
   if(device!=cfgDevice && pendingCount()>0) {
     web.send(409,"text/plain","Drain queued events before changing device identity"); return;
@@ -566,10 +588,7 @@ void savePortal() {
   p.putString("device",device);
   p.putString("ssid",ssid);
   if(pass.length() || ssid!=cfgSsid) p.putString("pass",pass);
-  p.putString("url",url);
-  if(key.length()) p.putString("pub",key);
-  if(token.length()) p.putString("token",token);
-  p.putBool("test",web.hasArg("test"));
+  p.putString("server",server);
   p.end();
   web.send(200,"text/html","<h2>Saved. Device restarting.</h2>");
   delay(450); ESP.restart();
@@ -640,19 +659,26 @@ void networkWorker(void*) {
       Serial.printf("[WIFI] Connected: %s channel=%d RSSI=%d\n",
         WiFi.localIP().toString().c_str(),WiFi.channel(),WiFi.RSSI());
     }
+    // The clock only matters for the HTTPS OTA check; the ERP is plain HTTP on the LAN.
     if(!clockStarted) {
       configTime(0,0,"pool.ntp.org","time.google.com");
       clockStarted=true;
-      Serial.println("[TIME] Synchronizing clock for verified HTTPS...");
     }
-    if(!clockValid()) {vTaskDelay(pdMS_TO_TICKS(400));continue;}
-    if(!checkedOTAOnConnect || wantOTA || millis()-lastOtaCheck>=OTA_CHECK_MS) {
+    if(clockValid() && (!checkedOTAOnConnect || wantOTA || millis()-lastOtaCheck>=OTA_CHECK_MS)) {
       checkedOTAOnConnect=true;wantOTA=false;lastOtaCheck=millis();
-      checkGitHubOTA(); // Immediately after Wi-Fi+time, before first API POST.
+      checkGitHubOTA();
     }
-    if(pendingCount()>0 && (int32_t)(millis()-nextPost)>=0) {
-      bool ok=sendFirstEvent();
-      nextPost=millis()+(ok?150UL:POST_RETRY_MS);
+    if(serverSet()) {
+      if(pendingCount()>0) {
+        if((int32_t)(millis()-nextPost)>=0) {
+          bool ok=sendFirstEvent();
+          nextPost=millis()+(ok?150UL:POST_RETRY_MS);
+          if(ok) lastHeartbeat=millis(); // the ERP just heard from it
+        }
+      } else if(millis()-lastHeartbeat>=HEARTBEAT_MS) {
+        lastHeartbeat=millis();
+        sendHeartbeat();
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -673,13 +699,12 @@ void setup() {
   Serial.printf("[RFID] MFRC522 version=0x%02X\n",rfid.PCD_ReadRegister(MFRC522::VersionReg));
   queueLock=xSemaphoreCreateMutex();
   if(!queueLock) {Serial.println("[FATAL] Could not create queue mutex");while(true)delay(1000);}
-  bootId=esp_random();
+  readIdentity();
   loadQueue();loadConfig();
   WiFi.onEvent(onWiFiEvent);
-  enqueueEvent(0); // DEVICE_ON test/production event, stored before Wi-Fi/OTA.
-  if(cfgSsid.startsWith("YOUR_") || cfgUrl.indexOf("YOUR_PROJECT_REF")>=0 ||
-     cfgKey.indexOf("YOUR_PUBLISHABLE_KEY")>=0 || cfgToken.startsWith("YOUR_")) {
-    Serial.println("[SETUP] Fill placeholder credentials or configure through hotspot.");
+  enqueueEvent(0); // DEVICE_ON, stored before Wi-Fi/OTA.
+  if(cfgSsid.startsWith("YOUR_") || !serverSet()) {
+    Serial.println("[SETUP] Set Wi-Fi and the ERP address through the setup hotspot.");
     startPortal();
   } else startWiFi();
   if(xTaskCreate(networkWorker,"sb2-net",12288,nullptr,1,nullptr)!=pdPASS)
